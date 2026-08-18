@@ -1091,7 +1091,21 @@ for row_index, row in df.iterrows():
 status.write("Checking flags...")
 progress.progress(78)
 
-if flag_library_mode != "Do Not Check Flags":
+flag_library_available = (
+    os.path.isdir(COUNTRY_FLAG_LIBRARY)
+    or os.path.isdir(STATE_FLAG_LIBRARY)
+)
+
+if flag_library_mode == "Do Not Check Flags":
+    flag_check_status = "Flag checking turned off."
+
+elif not flag_library_available:
+    flag_check_status = (
+        "Flag library is not connected on this online app, "
+        "so flag checking was skipped."
+    )
+
+else:
     country_names = get_flag_names(COUNTRY_FLAG_LIBRARY)
     state_names = get_flag_names(STATE_FLAG_LIBRARY)
 
@@ -1132,14 +1146,13 @@ if flag_library_mode != "Do Not Check Flags":
             available_names = country_names
             selected_label = "Countries / Historical"
 
+    flag_check_status = f"Flag library used: {selected_label}"
+
     for entity in sorted(set(entities)):
         if find_flag_exact(entity, selected_folder) is not None:
             continue
 
-        suggestion = suggest_flag_match(
-            entity,
-            available_names
-        )
+        suggestion = suggest_flag_match(entity, available_names)
 
         if suggestion:
             add_audit(
@@ -1419,14 +1432,21 @@ if not audit_df.empty:
     priority_countries.sort(key=lambda x: best_rank_by_entity.get(x, 999999))
     other_countries.sort()
 
-    all_countries = priority_countries + other_countries
     completed_set = set(st.session_state["_completed_countries"])
-    remaining_countries = [c for c in all_countries if c not in completed_set]
+
+    priority_remaining = [
+        c for c in priority_countries
+        if c not in completed_set
+    ]
+    priority_completed = [
+        c for c in priority_countries
+        if c in completed_set
+    ]
 
     m1, m2, m3 = st.columns(3)
     m1.metric(f"Top {int(important_rank)} Priority", len(priority_countries))
-    m2.metric("Countries Remaining", len(remaining_countries))
-    m3.metric("Completed", len([c for c in all_countries if c in completed_set]))
+    m2.metric("Priority Remaining", len(priority_remaining))
+    m3.metric("Priority Completed", len(priority_completed))
 
     if priority_countries:
         st.info(
@@ -1434,9 +1454,9 @@ if not audit_df.empty:
             + ", ".join(priority_countries)
         )
 
-    st.subheader("Countries Needing Review")
+    st.subheader("Priority Countries Needing Review")
 
-    for country_name in remaining_countries:
+    for country_name in priority_remaining:
         findings = country_audit[
             country_audit["Entity"].astype(str).eq(country_name)
         ].reset_index(drop=True)
@@ -1568,13 +1588,12 @@ if not audit_df.empty:
                     f"{pending} problem(s) remaining. Fix or Ignore each one to complete this country."
                 )
 
-    completed_now = [c for c in all_countries if c in completed_set]
-    if completed_now:
+    if priority_completed:
         with st.expander(
-            f"Completed Countries ({len(completed_now)})",
+            f"Completed Priority Countries ({len(priority_completed)})",
             expanded=False
         ):
-            for country_name in completed_now:
+            for country_name in priority_completed:
                 cc1, cc2 = st.columns([4, 1])
                 cc1.write(f"✅ {country_name}")
                 if cc2.button(
@@ -1583,141 +1602,51 @@ if not audit_df.empty:
                 ):
                     st.session_state["_completed_countries"].remove(country_name)
                     st.rerun()
+
+    if other_countries:
+        with st.expander(
+            f"Lower Priority Problems ({len(other_countries)} countries)",
+            expanded=False
+        ):
+            st.caption(
+                f"These countries never entered Top {int(important_rank)}. "
+                "They are kept separate so they do not slow down the priority review."
+            )
+            for country_name in other_countries:
+                findings = country_audit[
+                    country_audit["Entity"].astype(str).eq(country_name)
+                ].reset_index(drop=True)
+                best_rank = best_rank_by_entity.get(country_name)
+                rank_text = f" • Best Rank #{best_rank}" if best_rank is not None else ""
+                with st.expander(
+                    f"{country_name} — {len(findings)} problem(s){rank_text}",
+                    expanded=False
+                ):
+                    for problem_number, finding in findings.iterrows():
+                        category = str(finding["Category"])
+                        period_text = str(finding.get("Period", "")).strip()
+                        st.markdown(f"**{problem_number + 1}. {category}**")
+                        if period_text:
+                            st.write(f"Period: **{period_text}**")
+                        context = _context_rows(country_name, period_text)
+                        if context:
+                            st.dataframe(
+                                pd.DataFrame(context),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                        details = str(finding.get("Details", "")).strip()
+                        suggestion = str(finding.get("Suggestion", "")).strip()
+                        if details:
+                            st.write(details)
+                        if suggestion:
+                            st.caption(suggestion)
+                        st.divider()
 else:
     st.success("No country problems found.")
 
-st.divider()
-st.subheader("Quick Safe Fixes")
-
-# Safe internal gaps only
-safe_gap_rows = []
-
-if not audit_df.empty:
-    gap_df = audit_df[
-        audit_df["Category"].eq("Internal Gap")
-    ].copy()
-
-    for _, finding in gap_df.iterrows():
-        entity_name = str(finding["Entity"])
-        period_text = str(finding["Period"])
-
-        row_matches = df.index[
-            df[entity_column]
-            .astype(str)
-            .str.strip()
-            .eq(entity_name)
-        ].tolist()
-
-        if not row_matches:
-            continue
-
-        row_index = row_matches[0]
-        labels = [str(column) for column in period_columns]
-
-        if "→" in period_text:
-            start_label, end_label = [
-                part.strip()
-                for part in period_text.split("→", 1)
-            ]
-        else:
-            start_label = end_label = period_text
-
-        if start_label not in labels or end_label not in labels:
-            continue
-
-        start_index = labels.index(start_label)
-        end_index = labels.index(end_label)
-
-        previous_value, next_value = surrounding_values(
-            df,
-            row_index,
-            start_index,
-            end_index,
-            period_columns
-        )
-
-        if (
-            previous_value is not None
-            and next_value is not None
-        ):
-            safe_gap_rows.append({
-                "Entity": entity_name,
-                "Period": period_text,
-                "Missing Cells": end_index - start_index + 1,
-                "_row_index": row_index,
-                "_start_index": start_index,
-                "_end_index": end_index,
-                "_previous": previous_value,
-                "_next": next_value
-            })
-
-safe_gap_df = pd.DataFrame(safe_gap_rows)
-
-if safe_gap_df.empty:
-    st.info("No safe internal gaps are available for automatic Series Fill.")
-else:
-    st.success(
-        f"{len(safe_gap_df)} safe missing range(s) can be Series Filled automatically."
-    )
-
-    st.dataframe(
-        safe_gap_df[
-            ["Entity", "Period", "Missing Cells"]
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    confirm_fill = st.checkbox(
-        f"Series Fill all {len(safe_gap_df)} safe missing range(s)."
-    )
-
-    if st.button(
-        "FIX SAFE MISSING DATA",
-        type="primary",
-        disabled=not confirm_fill,
-        use_container_width=True
-    ):
-        corrected_df = st.session_state["_simple_checker_df"].copy()
-        fixed_cells = 0
-
-        for _, item in safe_gap_df.iterrows():
-            row_index = int(item["_row_index"])
-            start_index = int(item["_start_index"])
-            end_index = int(item["_end_index"])
-
-            problem_columns = period_columns[
-                start_index:end_index + 1
-            ]
-
-            proposed = linear_fill_values(
-                len(problem_columns),
-                float(item["_previous"]),
-                float(item["_next"]),
-                int(correction_decimals)
-            )
-
-            if proposed is None:
-                continue
-
-            for column, value in zip(problem_columns, proposed):
-                corrected_df.loc[row_index, column] = value
-
-            fixed_cells += len(problem_columns)
-
-            st.session_state["_simple_checker_log"].append({
-                "Entity": item["Entity"],
-                "Problem": "Internal Gap",
-                "Period": item["Period"],
-                "Method": "Series Fill",
-                "Updated Cells": len(problem_columns)
-            })
-
-        st.session_state["_simple_checker_df"] = corrected_df
-        st.success(
-            f"Filled {fixed_cells} missing cell(s). Rechecking..."
-        )
-        st.rerun()
+if 'flag_check_status' in locals():
+    st.caption(flag_check_status)
 
 
 # =========================================================
