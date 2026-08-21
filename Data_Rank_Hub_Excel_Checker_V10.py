@@ -1620,31 +1620,41 @@ if not audit_df.empty:
         return "Reviewed"
 
     def _entity_review_status(entity_findings):
-        categories = set(entity_findings["Category"].astype(str).tolist())
         severities = set(entity_findings["Severity"].astype(str).tolist())
 
-        must_fix_categories = {
-            "Non-Numeric Value", "Negative Value", "Duplicate Entity",
-            "Duplicate Row", "Blank Entity Name", "Duplicate Period",
-            "Periods Out of Order", "Cumulative Value Decreased",
-            "Important Coverage Gap"
-        }
-
-        # Hard errors remain red, even if an interpolation can be suggested.
-        if "Error" in severities or categories.intersection(must_fix_categories):
+        # Keep the country/entity label consistent with the summary counters:
+        # only findings whose Severity is "Error" are true MUST FIX items.
+        if "Error" in severities:
             return "🔴 MUST FIX"
 
+        # Warnings/review items can still be marked EASY FIX when the app
+        # has a safe automatic correction available.
         for _, r in entity_findings.iterrows():
             category = str(r.get("Category", ""))
             period_text = str(r.get("Period", "")).strip()
+
             if category == "Internal Gap":
-                if _series_fill_plan(str(r.get("Entity", "")), period_text) is not None:
+                if _series_fill_plan(
+                    str(r.get("Entity", "")),
+                    period_text
+                ) is not None:
                     return "🟡 EASY FIX"
+
             elif category == "Suspicious Jump":
-                if _suspicious_jump_plan(str(r.get("Entity", "")), period_text) is not None:
+                if _suspicious_jump_plan(
+                    str(r.get("Entity", "")),
+                    period_text
+                ) is not None:
                     return "🟡 EASY FIX"
-            elif category in {"Repeated Consecutive Value", "Zero Run"}:
-                if _range_interpolation_plan(str(r.get("Entity", "")), period_text) is not None:
+
+            elif category in {
+                "Repeated Consecutive Value",
+                "Zero Run"
+            }:
+                if _range_interpolation_plan(
+                    str(r.get("Entity", "")),
+                    period_text
+                ) is not None:
                     return "🟡 EASY FIX"
 
         return "🟡 REVIEW"
