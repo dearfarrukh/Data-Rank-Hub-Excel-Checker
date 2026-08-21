@@ -570,13 +570,20 @@ period_columns = [
     for item in periods
 ]
 
+# Use the actual file CONTENT in the fingerprint.
+# The old version used only filename + sheet + byte length, which meant that
+# an edited Excel file could be treated as "the same file" when its size did
+# not change. In that case Streamlit kept the old dataframe in session_state
+# and newly deleted/changed cells could be missed.
+content_hash = hashlib.md5(uploaded_bytes).hexdigest()
+
 file_key = hashlib.md5(
     (
         file_name
         + "|"
         + str(sheet_name)
         + "|"
-        + str(len(uploaded_bytes))
+        + content_hash
     ).encode("utf-8")
 ).hexdigest()
 
@@ -585,6 +592,10 @@ if st.session_state.get("_simple_checker_file_key") != file_key:
     st.session_state["_simple_checker_df"] = df_source.copy()
     st.session_state["_simple_checker_checked"] = False
     st.session_state["_simple_checker_log"] = []
+
+    # Clear review state too, because it belongs to the previous file content.
+    st.session_state["_country_review_decisions"] = {}
+    st.session_state["_completed_countries"] = []
 
 working_df = st.session_state["_simple_checker_df"].copy()
 
@@ -1620,41 +1631,31 @@ if not audit_df.empty:
         return "Reviewed"
 
     def _entity_review_status(entity_findings):
+        categories = set(entity_findings["Category"].astype(str).tolist())
         severities = set(entity_findings["Severity"].astype(str).tolist())
 
-        # Keep the country/entity label consistent with the summary counters:
-        # only findings whose Severity is "Error" are true MUST FIX items.
-        if "Error" in severities:
+        must_fix_categories = {
+            "Non-Numeric Value", "Negative Value", "Duplicate Entity",
+            "Duplicate Row", "Blank Entity Name", "Duplicate Period",
+            "Periods Out of Order", "Cumulative Value Decreased",
+            "Important Coverage Gap"
+        }
+
+        # Hard errors remain red, even if an interpolation can be suggested.
+        if "Error" in severities or categories.intersection(must_fix_categories):
             return "🔴 MUST FIX"
 
-        # Warnings/review items can still be marked EASY FIX when the app
-        # has a safe automatic correction available.
         for _, r in entity_findings.iterrows():
             category = str(r.get("Category", ""))
             period_text = str(r.get("Period", "")).strip()
-
             if category == "Internal Gap":
-                if _series_fill_plan(
-                    str(r.get("Entity", "")),
-                    period_text
-                ) is not None:
+                if _series_fill_plan(str(r.get("Entity", "")), period_text) is not None:
                     return "🟡 EASY FIX"
-
             elif category == "Suspicious Jump":
-                if _suspicious_jump_plan(
-                    str(r.get("Entity", "")),
-                    period_text
-                ) is not None:
+                if _suspicious_jump_plan(str(r.get("Entity", "")), period_text) is not None:
                     return "🟡 EASY FIX"
-
-            elif category in {
-                "Repeated Consecutive Value",
-                "Zero Run"
-            }:
-                if _range_interpolation_plan(
-                    str(r.get("Entity", "")),
-                    period_text
-                ) is not None:
+            elif category in {"Repeated Consecutive Value", "Zero Run"}:
+                if _range_interpolation_plan(str(r.get("Entity", "")), period_text) is not None:
                     return "🟡 EASY FIX"
 
         return "🟡 REVIEW"
