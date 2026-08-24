@@ -1089,7 +1089,7 @@ for row_index, row in df.iterrows():
     ):
         add_audit(
             "Important Coverage Gap",
-            "Warning",
+            "Error",
             entity=entity_name,
             period=missing_range["label"],
             details=(
