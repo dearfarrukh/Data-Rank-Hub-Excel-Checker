@@ -11,9 +11,9 @@ import streamlit as st
 from openpyxl import load_workbook
 
 # =========================================================
-# DATA RANK HUB — SIMPLE EXCEL CHECKER
-# Upload → Check → Fix → Download
-# Same app can run locally or from Google Drive / Colab.
+# DATA RANK HUB — EXCEL CHECKER V11
+# Upload → Check → Rank-Aware Review → Fix → Download
+# Streamlit app; local/hosted environments supported.
 # =========================================================
 
 st.set_page_config(
@@ -21,8 +21,8 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Data Rank Hub Excel Checker")
-st.caption("Upload → Check → Fix → Download")
+st.title("Data Rank Hub Excel Checker V11")
+st.caption("Upload → Check → Rank-Aware Review → Fix → Download")
 
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
 
@@ -449,6 +449,61 @@ def linear_fill_values(count, previous_value, next_value, decimals):
         for i in range(count)
     ]
 
+
+def build_rank_context(df, entity_column, period_columns, top_n):
+    """Observed year/period ranks and Top-N cutoffs using available numeric values only."""
+    rank_by_period = {}
+    cutoff_by_period = {}
+    for column in period_columns:
+        vals = pd.to_numeric(df[column], errors="coerce")
+        ranks = vals.rank(method="min", ascending=False)
+        rank_by_period[str(column)] = ranks
+        available = vals.dropna().sort_values(ascending=False)
+        cutoff_by_period[str(column)] = (
+            float(available.iloc[top_n - 1]) if len(available) >= top_n else None
+        )
+    return rank_by_period, cutoff_by_period
+
+
+def nearest_numeric_context(df, row_index, target_index, period_columns, direction):
+    i = target_index + direction
+    while 0 <= i < len(period_columns):
+        col = period_columns[i]
+        val = pd.to_numeric(pd.Series([df.loc[row_index, col]]), errors="coerce").iloc[0]
+        if not pd.isna(val):
+            return i, col, float(val)
+        i += direction
+    return None
+
+
+def historical_lifecycle_status(entity_name, period_label, time_type):
+    """Conservative historical entity lifecycle rules. Only clear political entity periods are ignored."""
+    if time_type != "Annual":
+        return None
+    try:
+        year = int(str(period_label))
+    except Exception:
+        return None
+    n = normalize_name(entity_name)
+    rules = {
+        "ussr": (None, 1991, "USSR ended after 1991"),
+        "soviet union": (None, 1991, "Soviet Union ended after 1991"),
+        "russia": (1992, None, "Russia series starts after USSR dissolution"),
+        "czechoslovakia": (None, 1992, "Czechoslovakia ended after 1992"),
+        "czechia": (1993, None, "Czechia successor series starts in 1993"),
+        "czech republic": (1993, None, "Czech successor series starts in 1993"),
+        "slovakia": (1993, None, "Slovakia successor series starts in 1993"),
+        "west germany": (None, 1990, "West Germany ended with reunification in 1990"),
+        "east germany": (None, 1990, "East Germany ended with reunification in 1990"),
+    }
+    if n not in rules:
+        return None
+    start, end, note = rules[n]
+    if start is not None and year < start:
+        return note
+    if end is not None and year > end:
+        return note
+    return None
 
 def make_corrected_workbook(
     uploaded_bytes,
@@ -1011,93 +1066,90 @@ for row_index, row in df.iterrows():
         previous_column = str(column)
 
 # ---------------------------------------------------------
-# Priority ranks
+# V11 — year/period-specific ranks and coverage risk
 # ---------------------------------------------------------
 
-status.write("Checking important entities...")
+status.write("Checking year-by-year ranking risk...")
 progress.progress(66)
 
+rank_by_period, cutoff_by_period = build_rank_context(
+    df, entity_column, period_columns, int(important_rank)
+)
+
 best_rank_by_entity = {}
-
-for period in periods:
-    column = period["original_column"]
-    numeric_values = pd.to_numeric(
-        df[column],
-        errors="coerce"
-    )
-    ranks = numeric_values.rank(
-        method="min",
-        ascending=False
-    )
-
+for column in period_columns:
+    ranks = rank_by_period[str(column)]
     for row_index, rank_value in ranks.items():
         if pd.isna(rank_value):
             continue
-
-        entity_name = str(
-            df.loc[row_index, entity_column]
-        ).strip()
-
+        entity_name = str(df.loc[row_index, entity_column]).strip()
         if not entity_name:
             continue
-
         rank_number = int(rank_value)
         current_best = best_rank_by_entity.get(entity_name)
-
-        if (
-            current_best is None
-            or rank_number < current_best
-        ):
+        if current_best is None or rank_number < current_best:
             best_rank_by_entity[entity_name] = rank_number
 
-# Important start/end coverage
+# Leading/trailing gaps are no longer automatically errors just because an
+# entity entered Top N at some other time. Assess each boundary year locally.
 for row_index, row in df.iterrows():
     entity_name = str(row[entity_column]).strip()
-
     if not entity_name:
         continue
-
-    best_rank = best_rank_by_entity.get(entity_name)
-
-    if (
-        best_rank is None
-        or best_rank > int(important_rank)
-    ):
-        continue
-
-    numeric_series = pd.to_numeric(
-        row[period_columns],
-        errors="coerce"
-    )
-
-    valid_positions = [
-        i for i, value in enumerate(numeric_series.tolist())
-        if not pd.isna(value)
-    ]
-
+    numeric_series = pd.to_numeric(row[period_columns], errors="coerce")
+    valid_positions = [i for i, value in enumerate(numeric_series.tolist()) if not pd.isna(value)]
     if not valid_positions:
         continue
 
-    leading_missing = list(range(0, valid_positions[0]))
-    trailing_missing = list(
+    boundary_missing = list(range(0, valid_positions[0])) + list(
         range(valid_positions[-1] + 1, len(period_columns))
     )
 
-    for missing_range in (
-        compress_missing_ranges(leading_missing, period_columns)
-        + compress_missing_ranges(trailing_missing, period_columns)
-    ):
+    for i in boundary_missing:
+        col = period_columns[i]
+        period_label = str(col)
+        lifecycle_note = historical_lifecycle_status(entity_name, period_label, time_type)
+        if lifecycle_note:
+            continue
+
+        prev_ctx = nearest_numeric_context(df, row_index, i, period_columns, -1)
+        next_ctx = nearest_numeric_context(df, row_index, i, period_columns, 1)
+        adjacent = prev_ctx if prev_ctx is not None else next_ctx
+        if adjacent is None:
+            continue
+        adj_i, adj_col, adj_val = adjacent
+        adj_rank_raw = rank_by_period[str(adj_col)].loc[row_index]
+        adj_rank = int(adj_rank_raw) if not pd.isna(adj_rank_raw) else None
+        cutoff = cutoff_by_period.get(period_label)
+
+        # Only call it high-priority when nearby observed evidence places the
+        # entity inside Top N. Otherwise boundary gaps are review items, not errors.
+        if adj_rank is not None and adj_rank <= int(important_rank):
+            severity = "Warning"
+            category = "Top-N Boundary Gap"
+            priority_hint = "HIGH PRIORITY"
+        else:
+            severity = "Review"
+            category = "Boundary Coverage Gap"
+            priority_hint = "Lower Priority"
+
+        cutoff_text = f"{cutoff:,.6g}" if cutoff is not None else "N/A"
         add_audit(
-            "Important Coverage Gap",
-            "Error",
+            category,
+            severity,
             entity=entity_name,
-            period=missing_range["label"],
+            period=period_label,
             details=(
-                f"{missing_range['length']} missing period(s) "
-                f"for an entity that reached Top {int(important_rank)}."
+                f"Missing boundary value. Nearest observed period {adj_col} = {adj_val:,.6g} "
+                f"(observed rank #{adj_rank if adj_rank is not None else 'N/A'}). "
+                f"This period's observed Top {int(important_rank)} cutoff = {cutoff_text}."
             ),
-            suggestion="Review whether reliable data can be added."
+            suggestion=(
+                "Research this year if it could affect the selected Top-N. "
+                "Do not Series Fill a beginning/end gap automatically."
+            )
         )
+        audit_rows[-1]["_V11PriorityHint"] = priority_hint
 
 # ---------------------------------------------------------
 # Flags
@@ -1234,22 +1286,53 @@ for _, row in df.iterrows():
         "Last Available": last_available
     })
 
-# Priority fields
+# V11 context fields: exact affected period, nearby values/ranks, and Top-N cutoff.
+labels_v11 = [str(c) for c in period_columns]
 for finding in audit_rows:
     entity_name = str(finding.get("Entity", "")).strip()
     best_rank = best_rank_by_entity.get(entity_name)
+    finding["Best Rank"] = best_rank if best_rank is not None else ""
+    finding["Error Year"] = ""
+    finding["Error Year Rank"] = ""
+    finding["Previous Year Value"] = ""
+    finding["Previous Year Rank"] = ""
+    finding["Next Year Value"] = ""
+    finding["Next Year Rank"] = ""
+    finding["Top N Cutoff"] = ""
 
-    finding["Best Rank"] = (
-        best_rank if best_rank is not None else ""
-    )
+    period_text = str(finding.get("Period", "")).strip()
+    parts = [p.strip() for p in period_text.split("→") if p.strip()]
+    affected = parts[-1] if parts else ""
+    if affected in labels_v11:
+        i = labels_v11.index(affected)
+        finding["Error Year"] = affected
+        cutoff = cutoff_by_period.get(affected)
+        finding["Top N Cutoff"] = cutoff if cutoff is not None else ""
+        row_matches = df.index[df[entity_column].astype(str).str.strip().eq(entity_name)].tolist()
+        if row_matches:
+            ri = row_matches[0]
+            er = rank_by_period[affected].loc[ri]
+            finding["Error Year Rank"] = int(er) if not pd.isna(er) else "N/A"
+            prev_ctx = nearest_numeric_context(df, ri, i, period_columns, -1)
+            next_ctx = nearest_numeric_context(df, ri, i, period_columns, 1)
+            if prev_ctx:
+                _, pc, pv = prev_ctx
+                pr = rank_by_period[str(pc)].loc[ri]
+                finding["Previous Year Value"] = pv
+                finding["Previous Year Rank"] = int(pr) if not pd.isna(pr) else ""
+            if next_ctx:
+                _, nc, nv = next_ctx
+                nr = rank_by_period[str(nc)].loc[ri]
+                finding["Next Year Value"] = nv
+                finding["Next Year Rank"] = int(nr) if not pd.isna(nr) else ""
 
-    if (
-        best_rank is not None
-        and best_rank <= int(important_rank)
-    ):
+    hint = finding.pop("_V11PriorityHint", None)
+    if hint:
+        finding["Priority"] = hint
+    elif finding.get("Severity") == "Error":
         finding["Priority"] = "HIGH PRIORITY"
     elif entity_name:
-        finding["Priority"] = "Lower Priority"
+        finding["Priority"] = "Review"
     else:
         finding["Priority"] = "General"
 
@@ -1296,6 +1379,15 @@ status.write("Check complete.")
 # =========================================================
 
 st.header("3. Problems")
+
+# V11 simple decision summary
+_non_flag = audit_df[~audit_df["Category"].isin(["Missing Flag", "Flag Name Mismatch"])] if not audit_df.empty else audit_df
+_v11_critical = int((_non_flag["Severity"].eq("Error")).sum()) if not _non_flag.empty else 0
+_v11_topn_risk = int((_non_flag["Priority"].eq("HIGH PRIORITY")).sum()) if not _non_flag.empty else 0
+if _v11_critical == 0 and _v11_topn_risk == 0:
+    st.success("V11 RESULT: READY — Top-N ranking safe based on detected issues: YES")
+else:
+    st.warning(f"V11 RESULT: REVIEW NEEDED — Top-N ranking safe: NO | High-priority findings: {_v11_topn_risk}")
 
 if audit_df.empty:
     st.success("READY FOR BAR CHART RACE — No problems found.")
@@ -1390,9 +1482,13 @@ def _context_rows(entity_name, period_text):
         col = period_columns[i]
         raw = st.session_state["_simple_checker_df"].loc[row_index, col]
         numeric = pd.to_numeric(pd.Series([raw]), errors="coerce").iloc[0]
+        rank_raw = rank_by_period[str(col)].loc[row_index]
+        cutoff = cutoff_by_period.get(str(col))
         rows.append({
             "Period": str(col),
-            "Value": "Missing" if pd.isna(numeric) else numeric
+            "Value": "Missing" if pd.isna(numeric) else numeric,
+            "Observed Rank": "N/A" if pd.isna(rank_raw) else int(rank_raw),
+            f"Top {int(important_rank)} Cutoff": "N/A" if cutoff is None else cutoff
         })
     return rows
 
@@ -1458,12 +1554,12 @@ if not audit_df.empty:
             "finding": blank_finding
         })
 
-    # Priority = any entity that entered selected Top N at least once.
+    # V11: priority is based on current year-specific findings, not "ever Top N".
     priority_countries = []
     other_countries = []
     for name in country_audit["Entity"].astype(str).drop_duplicates():
-        rank = best_rank_by_entity.get(name)
-        if rank is not None and rank <= int(important_rank):
+        entity_findings = country_audit[country_audit["Entity"].astype(str).eq(name)]
+        if entity_findings["Priority"].astype(str).eq("HIGH PRIORITY").any():
             priority_countries.append(name)
         else:
             other_countries.append(name)
@@ -1492,7 +1588,7 @@ if not audit_df.empty:
     ]
 
     m1, m2, m3 = st.columns(3)
-    m1.metric(f"Entities Ever in Top {int(important_rank)}", len(priority_countries))
+    m1.metric(f"Current Top-{int(important_rank)} Risk Entities", len(priority_countries))
     m2.metric("Priority Remaining", len(priority_remaining))
     m3.metric("Priority Completed", len(priority_completed))
 
@@ -1504,7 +1600,7 @@ if not audit_df.empty:
 
     if priority_countries:
         st.info(
-            f"Top {int(important_rank)} entities with detected problems: "
+            f"Current year-specific Top {int(important_rank)} risk entities: "
             + ", ".join(priority_countries)
         )
 
@@ -2188,7 +2284,7 @@ if not audit_df.empty:
             expanded=False
         ):
             st.caption(
-                f"These entities never entered Top {int(important_rank)}, "
+                "These findings are not currently classified as year-specific high-priority Top-N risks, "
                 "but they can still be fixed and reviewed here."
             )
 
@@ -2540,6 +2636,13 @@ with st.expander(
             "Category",
             "Entity",
             "Best Rank",
+            "Error Year",
+            "Previous Year Value",
+            "Previous Year Rank",
+            "Error Year Rank",
+            "Top N Cutoff",
+            "Next Year Value",
+            "Next Year Rank",
             "Period",
             "Value",
             "Details",
@@ -2629,6 +2732,8 @@ with d2:
         )
 
         pd.DataFrame([{
+            "Checker Version": "V11",
+            "Important Rank": int(important_rank),
             "File": file_name,
             "Sheet": sheet_name,
             "Entity Column": entity_column,
